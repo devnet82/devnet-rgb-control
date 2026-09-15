@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "--version" ]]; then
+  echo "Devnet RGB Control v8.8"
+  exit 0
+fi
+exec xdg-open "http://127.0.0.1:8765/"
