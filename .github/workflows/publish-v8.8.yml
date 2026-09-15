@@ -1,0 +1,42 @@
+name: Publish Devnet RGB v8.8
+
+on:
+  push:
+    branches:
+      - publish-v8.8
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Run release QA
+        run: bash tests/test-package.sh
+
+      - name: Build release archive and checksum
+        run: |
+          git archive --format=zip --prefix=devnet-rgb-control-v8.8/ main -o devnet-rgb-control-v8.8.zip
+          sha256sum devnet-rgb-control-v8.8.zip > devnet-rgb-control-v8.8.zip.sha256
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view v8.8 >/dev/null 2>&1; then
+            echo "Release v8.8 already exists; refusing to replace it."
+            exit 1
+          fi
+          gh release create v8.8 \
+            devnet-rgb-control-v8.8.zip \
+            devnet-rgb-control-v8.8.zip.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
+            --target main \
+            --title "Devnet RGB Control v8.8" \
+            --notes-file RELEASE-NOTES.md
