@@ -1,0 +1,382 @@
+#!/usr/bin/env python3
+import html
+import json
+import shutil
+import subprocess
+import sys
+import time
+import urllib.parse
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+from openrgb import OpenRGBClient
+from openrgb.utils import RGBColor
+
+APP_VERSION = "8.8"
+HOST = "127.0.0.1"
+PORT = 8765
+HOME = Path.home()
+CFG_PATH = HOME / ".config/devnet-rgb-master/config.json"
+OVERRIDE_PATH = HOME / ".config/devnet-rgb-master/manual_override.json"
+PROFILE_DIR = HOME / "OpenLinkHub/database/profiles"
+
+if "--version" in sys.argv:
+    print(f"Devnet RGB Control v{APP_VERSION} dashboard")
+    raise SystemExit(0)
+
+
+def load_cfg():
+    return json.loads(CFG_PATH.read_text())
+
+
+def save_cfg(cfg):
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = CFG_PATH.with_name(CFG_PATH.name + f".backup-{stamp}")
+    shutil.copy2(CFG_PATH, backup)
+    tmp = CFG_PATH.with_name(CFG_PATH.name + ".tmp")
+    tmp.write_text(json.dumps(cfg, indent=2) + "\n")
+    tmp.replace(CFG_PATH)
+    return backup
+
+
+def service_state(name):
+    p = subprocess.run(["systemctl", "--user", "is-active", name], stdout=subprocess.PIPE,
+                       stderr=subprocess.DEVNULL, text=True, timeout=4)
+    return p.stdout.strip() or "unknown"
+
+
+def gpu_temp(cfg):
+    helper = HOME / ".local/bin/devnet-gpu-hotspot"
+    p = subprocess.run([str(helper)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                       text=True, timeout=4)
+    if p.returncode != 0:
+        raise RuntimeError(p.stderr.strip() or "GPU hotspot reader failed")
+    return float(p.stdout.strip())
+
+
+def current_band(cfg, temp):
+    bands = cfg["bands"]
+    for i, b in enumerate(bands):
+        if temp <= float(b.get("max", 1e9)):
+            return i, b
+    return len(bands) - 1, bands[-1]
+
+
+def rgb_hex(rgb):
+    return f"#{int(rgb[0]):02X}{int(rgb[1]):02X}{int(rgb[2]):02X}"
+
+
+def hex_rgb(value):
+    value = value.strip().lstrip("#")
+    if len(value) != 6:
+        raise ValueError("Colour must be #RRGGBB")
+    try:
+        return [int(value[i:i+2], 16) for i in (0, 2, 4)]
+    except ValueError:
+        raise ValueError("Colour must be #RRGGBB")
+
+
+def read_override():
+    try:
+        d = json.loads(OVERRIDE_PATH.read_text())
+        rgb = d.get("rgb")
+        if d.get("enabled") and isinstance(rgb, list) and len(rgb) == 3:
+            return {"enabled": True, "rgb": [max(0, min(255, int(x))) for x in rgb]}
+    except Exception:
+        pass
+    return {"enabled": False, "rgb": [0, 0, 255]}
+
+
+def save_override(rgb):
+    OVERRIDE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    OVERRIDE_PATH.write_text(json.dumps({"enabled": True, "rgb": rgb}, indent=2) + "\n")
+
+
+def clear_override():
+    OVERRIDE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    OVERRIDE_PATH.write_text(json.dumps({"enabled": False}, indent=2) + "\n")
+
+
+def local_snapshot(cfg):
+    c = None
+    try:
+        c = OpenRGBClient(cfg.get("local_sdk_host", "127.0.0.1"), int(cfg.get("local_sdk_port", 6742)),
+                          f"Devnet RGB Control v{APP_VERSION} status", protocol_version=1)
+        names = [d.name for d in c.devices]
+        low = [n.lower() for n in names]
+        mobo = cfg["motherboard"].lower()
+        gpu = cfg["gpu_rgb_device"].lower()
+        ram = cfg.get("ram_rgb_device", "Corsair Vengeance RGB DDR5").lower()
+        return {
+            "ok": True,
+            "mobo": any(mobo in n or n in mobo for n in low),
+            "gpu": any(gpu in n or n in gpu for n in low),
+            "ram": sum(ram in n for n in low),
+            "ram_expected": int(cfg.get("ram_count", 2)),
+            "commander_present": any("commander" in n and "core" in n for n in low),
+        }
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    finally:
+        if c is not None:
+            try: c.disconnect()
+            except Exception: pass
+
+
+def hub_snapshot(cfg):
+    c = None
+    try:
+        c = OpenRGBClient(cfg.get("hub_sdk_host", "127.0.0.1"), int(cfg.get("hub_sdk_port", 6743)),
+                          f"Devnet RGB Control v{APP_VERSION} status hub")
+        d = next((x for x in c.devices if "commander" in x.name.lower() and "core" in x.name.lower()), None)
+        if d is None:
+            return {"ok": False, "error": "COMMANDER CORE XT not exposed on 6743"}
+        return {"ok": True, "name": d.name, "zones": len(d.zones or []), "leds": len(d.leds or [])}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    finally:
+        if c is not None:
+            try: c.disconnect()
+            except Exception: pass
+
+
+def profile_state(cfg):
+    serial = str(cfg.get("commander_serial", "")).strip()
+    out = {}
+    if not serial:
+        return {"main": {"exists": False, "error": "Commander serial not configured"},
+                "temp": {"exists": False, "error": "Commander serial not configured"}}
+    for key, name in (("main", f"{serial}.json"), ("temp", f"{serial}-temp.json")):
+        p = PROFILE_DIR / name
+        if not p.exists():
+            out[key] = {"exists": False}
+            continue
+        try:
+            d = json.loads(p.read_text())
+            out[key] = {"exists": True, "OpenRGBIntegration": d.get("OpenRGBIntegration"),
+                        "MultiRGB": d.get("MultiRGB")}
+        except Exception as e:
+            out[key] = {"exists": True, "error": str(e)}
+    return out
+
+
+def write_color(rgb):
+    cfg = load_cfg()
+    color = RGBColor(*rgb)
+    results = []
+    local = None
+    try:
+        local = OpenRGBClient(cfg.get("local_sdk_host", "127.0.0.1"), int(cfg.get("local_sdk_port", 6742)),
+                              f"Devnet RGB Control v{APP_VERSION} write", protocol_version=1)
+        mobo = cfg["motherboard"].lower(); gpu = cfg["gpu_rgb_device"].lower()
+        ram = cfg.get("ram_rgb_device", "Corsair Vengeance RGB DDR5").lower()
+        for d in local.devices:
+            n = d.name.lower()
+            if mobo in n or n in mobo or gpu in n or n in gpu or ram in n:
+                d.set_color(color, fast=True)
+                results.append(f"{d.name}=OK")
+    finally:
+        if local is not None:
+            try: local.disconnect()
+            except Exception: pass
+
+    hub = None
+    try:
+        hub = OpenRGBClient(cfg.get("hub_sdk_host", "127.0.0.1"), int(cfg.get("hub_sdk_port", 6743)),
+                            f"Devnet RGB Control v{APP_VERSION} hub write")
+        commander = next((d for d in hub.devices if "commander" in d.name.lower() and "core" in d.name.lower()), None)
+        if commander is None:
+            raise RuntimeError("Commander not found on 6743")
+        commander.set_color(color, fast=True)
+        results.append("COMMANDER CORE XT whole-device=OK")
+    finally:
+        if hub is not None:
+            try: hub.disconnect()
+            except Exception: pass
+    return results
+
+
+def restart_master():
+    def main_pid():
+        p = subprocess.run(["systemctl", "--user", "show", "-p", "MainPID", "--value",
+                            "devnet-rgb-master.service"], stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, text=True, timeout=4)
+        try: return int(p.stdout.strip() or "0")
+        except ValueError: return 0
+
+    old_pid = main_pid()
+    subprocess.run(["systemctl", "--user", "reset-failed", "devnet-rgb-master.service"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+    subprocess.run(["systemctl", "--user", "kill", "--kill-who=main", "--signal=SIGKILL",
+                    "devnet-rgb-master.service"], stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, timeout=5)
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        state = service_state("devnet-rgb-master.service"); pid = main_pid()
+        if state == "active" and pid > 0 and pid != old_pid: return
+        time.sleep(0.5)
+    subprocess.run(["systemctl", "--user", "reset-failed", "devnet-rgb-master.service"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+    subprocess.run(["systemctl", "--user", "start", "devnet-rgb-master.service"], check=True, timeout=15)
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        if service_state("devnet-rgb-master.service") == "active" and main_pid() > 0: return
+        time.sleep(0.5)
+    raise RuntimeError("RGB master did not become active after reload")
+
+
+def save_band_colours(form):
+    cfg = load_cfg(); bands = cfg.get("bands")
+    if not isinstance(bands, list) or not bands:
+        raise RuntimeError("No temperature bands found in config")
+    changed = []
+    for i, band in enumerate(bands):
+        key = f"band_{i}"
+        if key not in form: raise ValueError(f"Missing colour for band {i+1}")
+        old = list(band["rgb"]); new = hex_rgb(form[key][0]); band["rgb"] = new
+        if old != new: changed.append(f"{band.get('name', f'Band {i+1}')}: {rgb_hex(old)} → {rgb_hex(new)}")
+    backup = save_cfg(cfg); restart_master(); override = read_override()
+    if not override["enabled"]:
+        t = gpu_temp(cfg); _, band = current_band(cfg, t); write_color(band["rgb"])
+    if changed: return "Saved temperature colours. " + " | ".join(changed) + f" | Backup: {backup.name}"
+    return "No colour changes were needed."
+
+
+def apply_manual(hexvalue):
+    rgb = hex_rgb(hexvalue); save_override(rgb); results = write_color(rgb)
+    return f"Manual colour {rgb_hex(rgb)} applied. " + "; ".join(results)
+
+
+def return_auto():
+    clear_override(); cfg = load_cfg(); t = gpu_temp(cfg); _, band = current_band(cfg, t); results = write_color(band["rgb"])
+    return f"Temperature mode restored: GPU Hotspot {t:.1f}C -> {band['name']} {rgb_hex(band['rgb'])}. " + "; ".join(results)
+
+
+def reapply_current():
+    override = read_override()
+    if override["enabled"]:
+        results = write_color(override["rgb"]); return f"Manual mode reapplied: {rgb_hex(override['rgb'])}. " + "; ".join(results)
+    return return_auto()
+
+
+def off_test():
+    write_color([0, 0, 0]); time.sleep(3); return "3-second RGB-off test complete. " + reapply_current()
+
+
+def run_doctor():
+    doctor = HOME / ".local/bin/devnet-rgb-doctor"
+    if not doctor.exists(): return "Doctor command not installed.", 2
+    p = subprocess.run([str(doctor)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=30)
+    return p.stdout, p.returncode
+
+
+def recent_logs():
+    p = subprocess.run(["journalctl", "--user", "-u", "devnet-rgb-master.service", "-n", "80", "--no-pager"],
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
+    return p.stdout
+
+
+def esc(x): return html.escape(str(x))
+
+CSS = """
+:root { color-scheme: dark; }
+body { font-family:system-ui,sans-serif; background:#111318; color:#e8eaf0; margin:0; }
+.wrap { max-width:1100px; margin:0 auto; padding:24px; }
+h1 { margin:0 0 4px; font-size:30px; }
+.sub { color:#aab0bd; margin-bottom:22px; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(235px,1fr)); gap:14px; }
+.card { background:#1b1f27; border:1px solid #2c3340; border-radius:14px; padding:16px; }
+.card h3 { margin:0 0 9px; font-size:16px; }
+.big { font-size:28px; font-weight:700; }
+.ok { color:#7ee787; } .bad { color:#ff7b72; } .warn { color:#f2cc60; } .muted { color:#aab0bd; }
+.actions { display:flex; flex-wrap:wrap; gap:10px; margin:18px 0; align-items:center; }
+button,.button { border:0; border-radius:9px; padding:10px 14px; background:#2f81f7; color:white; font-weight:650; cursor:pointer; text-decoration:none; }
+button.secondary,.button.secondary { background:#30363d; }
+input[type=color] { width:76px; height:46px; border:1px solid #3a4352; border-radius:9px; background:#111318; padding:3px; cursor:pointer; }
+table { width:100%; border-collapse:collapse; } td,th { text-align:left; padding:9px; border-bottom:1px solid #2c3340; }
+pre { white-space:pre-wrap; word-break:break-word; background:#0d1117; padding:14px; border-radius:10px; overflow:auto; }
+.banner { padding:12px 14px; border-radius:10px; background:#183153; margin-bottom:16px; }
+.colorbox { width:100%; height:12px; border-radius:6px; margin-top:8px; }
+.bandcolor { display:flex; align-items:center; gap:12px; } small { color:#aab0bd; }
+"""
+
+
+def temp_range_text(bands, index):
+    hi = float(bands[index].get("max", 999.0))
+    if index == 0: return f"< {int(hi) + 1}°C"
+    prev = float(bands[index-1].get("max", -1.0))
+    lo = int(prev) + 1
+    if index == len(bands)-1 and hi >= 900: return f"≥ {lo}°C"
+    return f"{lo}–{int(hi)}°C"
+
+
+def render_home(message=""):
+    cfg = load_cfg(); override = read_override()
+    try:
+        t = gpu_temp(cfg); active_i, active_band = current_band(cfg, t); auto_rgb = active_band["rgb"]
+        temp_html = f"<div class='big'>{t:.1f}°C</div><div>{esc(active_band['name'])} {esc(rgb_hex(auto_rgb))}</div><div class='colorbox' style='background:{esc(rgb_hex(auto_rgb))}'></div>"
+    except Exception as e:
+        active_i = -1; auto_rgb = [0,0,255]; temp_html = f"<div class='bad'>Temperature error: {esc(e)}</div>"
+    mode_html = f"<div class='warn'>Manual {rgb_hex(override['rgb'])}</div>" if override["enabled"] else "<div class='ok'>GPU Hotspot Temperature</div>"
+    services = {"OpenRGB 6742": service_state("devnet-openrgb-server.service"), "RGB master": service_state("devnet-rgb-master.service"), "OpenLinkHub": service_state("OpenLinkHub.service")}
+    service_cards = "".join(f"<div class='card'><h3>{esc(k)}</h3><div class='{'ok' if v == 'active' else 'bad'}'>{esc(v)}</div></div>" for k,v in services.items())
+    local = local_snapshot(cfg); hub = hub_snapshot(cfg); prof = profile_state(cfg)
+    if local.get("ok"):
+        local_html = f"<div class='ok'>Connected</div><div>Motherboard: {'✓' if local['mobo'] else '✗'}</div><div>GPU: {'✓' if local['gpu'] else '✗'}</div><div>RAM: {local['ram']}/{local['ram_expected']}</div><div>Commander on 6742: {'YES - check isolation' if local['commander_present'] else 'No ✓'}</div>"
+    else: local_html = f"<div class='bad'>{esc(local.get('error'))}</div>"
+    if hub.get("ok"):
+        hub_html = f"<div class='ok'>Connected</div><div>{esc(hub['name'])}</div><div>{hub['zones']} zones / {hub['leds']} LEDs</div><div>Write mode: whole-device</div>"
+    else: hub_html = f"<div class='bad'>{esc(hub.get('error'))}</div>"
+    pmain = prof.get("main", {}); ptemp = prof.get("temp", {})
+    profile_html = f"<div>Main: Integration={esc(pmain.get('OpenRGBIntegration'))}, MultiRGB={esc(pmain.get('MultiRGB'))}</div><div>Temp: Integration={esc(ptemp.get('OpenRGBIntegration'))}, MultiRGB={esc(ptemp.get('MultiRGB'))}</div>"
+    bands = cfg.get("bands", []); band_rows=[]
+    for i,b in enumerate(bands):
+        colour=rgb_hex(b["rgb"]); active=" <strong class='ok'>← ACTIVE</strong>" if i==active_i and not override["enabled"] else ""
+        band_rows.append(f"<tr><td>{esc(temp_range_text(bands,i))}</td><td>{esc(b.get('name',f'Band {i+1}'))}{active}</td><td><div class='bandcolor'><input type='color' name='band_{i}' value='{colour}'><span>{colour}</span></div></td></tr>")
+    picker=rgb_hex(override["rgb"] if override["enabled"] else auto_rgb); banner=f"<div class='banner'>{esc(message)}</div>" if message else ""
+    return f"""<!doctype html><html><head><meta charset="utf-8"><title>Devnet RGB Control</title><style>{CSS}</style></head><body><div class="wrap">
+<h1>Devnet RGB Control</h1><div class="sub">v{APP_VERSION} • editable GPU-temperature colours • robust master recovery</div>{banner}
+<div class="grid"><div class="card"><h3>GPU Hotspot / Current Automatic Colour</h3>{temp_html}</div><div class="card"><h3>Active Mode</h3>{mode_html}</div>{service_cards}<div class="card"><h3>6742 Local RGB</h3>{local_html}</div><div class="card"><h3>6743 Commander</h3>{hub_html}</div><div class="card"><h3>OpenLinkHub RGB Ownership</h3>{profile_html}</div></div>
+<div class="card" style="margin-top:14px"><h3>Temperature Colour Editor</h3><div class="muted">Pick the colour you want for each temperature range. Temperature limits are left unchanged.</div><form method="post" action="/action/save-bands"><table><thead><tr><th>GPU hotspot temperature</th><th>Band</th><th>Colour</th></tr></thead><tbody>{''.join(band_rows)}</tbody></table><div class="actions"><button>Save Temperature Colours</button></div></form><small>A backup of config.json is made every time you save.</small></div>
+<div class="card" style="margin-top:14px"><h3>Manual Colour</h3><form method="post" action="/action/manual" class="actions"><input type="color" name="color" value="{picker}"><button>Apply Manual Colour</button></form><form method="post" action="/action/auto" class="actions"><button class="secondary">Return to GPU Hotspot Temperature Mode</button></form></div>
+<div class="actions"><form method="post" action="/action/reapply"><button>Reapply Current Colour</button></form><form method="post" action="/action/offtest"><button class="secondary">3s RGB-Off Test</button></form><a class="button secondary" href="/doctor">Run Self-Diagnostic</a><a class="button secondary" href="/logs">Recent Master Logs</a></div>
+<div class="card"><h3>Protected Fan Control</h3><div class="ok">OpenLinkHub remains responsible for fan speeds.</div><div class="muted">Saving RGB colours changes only config.json RGB values. Fan curves and SpeedProfiles are not edited.</div></div></div></body></html>"""
+
+
+def simple_page(title, content):
+    return f"<!doctype html><html><head><meta charset='utf-8'><title>{esc(title)}</title><style>{CSS}</style></head><body><div class='wrap'><h1>{esc(title)}</h1><div class='actions'><a class='button secondary' href='/'>← Dashboard</a></div>{content}</div></body></html>"
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args): pass
+    def send_html(self, body, status=200):
+        data=body.encode("utf-8"); self.send_response(status); self.send_header("Content-Type","text/html; charset=utf-8"); self.send_header("Content-Length",str(len(data))); self.end_headers(); self.wfile.write(data)
+    def redirect(self,msg):
+        self.send_response(303); self.send_header("Location","/?"+urllib.parse.urlencode({"m":msg})); self.end_headers()
+    def do_GET(self):
+        parsed=urllib.parse.urlparse(self.path)
+        if parsed.path=="/":
+            q=urllib.parse.parse_qs(parsed.query); self.send_html(render_home(q.get("m",[""])[0]))
+        elif parsed.path=="/doctor":
+            try:
+                out,rc=run_doctor(); cls="ok" if rc==0 else ("warn" if rc==1 else "bad"); self.send_html(simple_page("RGB Self-Diagnostic",f"<div class='{cls}'>Exit code: {rc}</div><pre>{esc(out)}</pre>"))
+            except Exception as e: self.send_html(simple_page("RGB Self-Diagnostic",f"<div class='bad'>{esc(e)}</div>"),500)
+        elif parsed.path=="/logs":
+            try: self.send_html(simple_page("Recent RGB Master Logs",f"<pre>{esc(recent_logs())}</pre>"))
+            except Exception as e: self.send_html(simple_page("Recent RGB Master Logs",f"<div class='bad'>{esc(e)}</div>"),500)
+        else: self.send_html(simple_page("Not Found","<div class='bad'>Unknown page.</div>"),404)
+    def do_POST(self):
+        path=urllib.parse.urlparse(self.path).path
+        try:
+            length=int(self.headers.get("Content-Length","0")); form=urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8","replace"))
+            if path=="/action/save-bands": self.redirect(save_band_colours(form)); return
+            if path=="/action/manual": self.redirect(apply_manual(form.get("color",[""])[0])); return
+            if path=="/action/auto": self.redirect(return_auto()); return
+            if path=="/action/reapply": self.redirect(reapply_current()); return
+            if path=="/action/offtest": self.redirect(off_test()); return
+            self.send_html(simple_page("Unknown Action","<div class='bad'>Unknown action.</div>"),404)
+        except Exception as e: self.send_html(simple_page("Action Failed",f"<div class='bad'>{esc(type(e).__name__+': '+str(e))}</div>"),500)
+
+if __name__ == "__main__":
+    ThreadingHTTPServer((HOST,PORT),Handler).serve_forever()
