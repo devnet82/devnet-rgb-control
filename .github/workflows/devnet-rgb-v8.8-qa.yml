@@ -1,0 +1,23 @@
+name: Devnet RGB v8.8 package QA
+
+on:
+  pull_request:
+    paths:
+      - 'standalone-v8.8-test/**'
+      - '.github/workflows/devnet-rgb-v8.8-qa.yml'
+  workflow_dispatch:
+
+jobs:
+  package-qa:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Show tool versions
+        run: |
+          bash --version | head -n1
+          python3 --version
+
+      - name: Run standalone package QA
+        run: bash standalone-v8.8-test/tests/test-package.sh
