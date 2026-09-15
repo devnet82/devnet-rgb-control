@@ -1,0 +1,24 @@
+{
+  "version": 6,
+  "app_version": "8.8",
+  "base_url": "http://127.0.0.1:27003",
+  "local_sdk_host": "127.0.0.1",
+  "local_sdk_port": 6742,
+  "hub_sdk_host": "127.0.0.1",
+  "hub_sdk_port": 6743,
+  "motherboard": "X870 EAGLE WIFI7",
+  "gpu_rgb_device": "PowerColor Red Devil RX9070XT",
+  "ram_rgb_device": "Corsair Vengeance RGB DDR5",
+  "ram_count": 2,
+  "commander_serial": "",
+  "poll_seconds": 3,
+  "hysteresis_c": 1.0,
+  "retry_seconds": 30,
+  "bands": [
+    {"max": 49.999, "name": "blue", "rgb": [153, 193, 241]},
+    {"max": 59.999, "name": "green", "rgb": [87, 227, 137]},
+    {"max": 69.999, "name": "yellow", "rgb": [255, 255, 0]},
+    {"max": 79.999, "name": "orange", "rgb": [255, 128, 0]},
+    {"max": 999.0, "name": "red", "rgb": [255, 0, 0]}
+  ]
+}
