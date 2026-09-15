@@ -10,6 +10,7 @@ fail(){ printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 
 [[ ${EUID:-$(id -u)} -ne 0 ]] || fail "Run this as your normal desktop user, not with sudo."
 command -v systemctl >/dev/null || fail "systemctl is required"
+command -v python3 >/dev/null || fail "python3 is required"
 
 if ! systemctl --user cat OpenLinkHub.service >/dev/null 2>&1; then
   fail "OpenLinkHub.service is not installed as a user service."
@@ -23,7 +24,7 @@ changed=0
 
 for p in "${PATHS[@]}"; do
   [[ -f "$p" ]] || continue
-  if grep -Eq '^[[:space:]]*After=.*(^|[[:space:]])default\.target([[:space:]]|$)' "$p"; then
+  if grep -Eq '^[[:space:]]*After=.*default\.target' "$p"; then
     cp -a "$p" "$BACKUP/$(basename "$p")"
     python3 - "$p" <<'PY'
 from pathlib import Path
