@@ -1,0 +1,13 @@
+[Unit]
+Description=Devnet RGB Control v8.8 local dashboard
+Wants=devnet-rgb-master.service
+After=devnet-rgb-master.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/devnet-rgb/venv/bin/python %h/.local/bin/devnet-rgb-control-app
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
