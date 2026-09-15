@@ -54,7 +54,6 @@ PY
 
 grep -q "$HOME_FAKE/.local/bin/devnet-rgb-control" "$HOME_FAKE/.local/share/applications/devnet-rgb-control.desktop"
 
-# Verify protected OpenLinkHub state survived fake install exactly.
 python3 - "$OLH" <<'PY'
 import json,sys
 from pathlib import Path
@@ -67,13 +66,14 @@ PY
 
 # Test rollback restores a prior file exactly.
 echo 'OLD-VERSION-SENTINEL' > "$HOME_FAKE/.local/bin/devnet-rgb-control"
-# Create a second install, which backs up the sentinel.
+sleep 1
 DEVNET_TEST_MODE=1 DEVNET_HOME="$HOME_FAKE" bash "$ROOT/install.sh"
 BACKUP="$(cat "$HOME_FAKE/.config/devnet-rgb-backups/last-v8.8-backup")"
 DEVNET_TEST_MODE=1 DEVNET_HOME="$HOME_FAKE" bash "$ROOT/rollback.sh" --backup "$BACKUP"
 grep -qx 'OLD-VERSION-SENTINEL' "$HOME_FAKE/.local/bin/devnet-rgb-control"
 
 # Reinstall and test uninstaller leaves OpenLinkHub and config data intact.
+sleep 1
 DEVNET_TEST_MODE=1 DEVNET_HOME="$HOME_FAKE" bash "$ROOT/install.sh"
 DEVNET_TEST_MODE=1 DEVNET_HOME="$HOME_FAKE" bash "$ROOT/uninstall.sh"
 [[ ! -e "$HOME_FAKE/.local/bin/devnet-rgb-master" ]]
