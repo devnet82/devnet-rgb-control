@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+import json, os, signal, subprocess, sys, time
+from pathlib import Path
+from openrgb import OpenRGBClient
+from openrgb.utils import RGBColor
+
+APP_VERSION="8.8"
+CFG_PATH=Path.home()/'.config/devnet-rgb-master/config.json'
+MANUAL_OVERRIDE_PATH=Path.home()/'.config/devnet-rgb-master/manual_override.json'
+STOP=False
+
+if "--version" in sys.argv:
+    print(f"Devnet RGB Control v{APP_VERSION} master")
+    raise SystemExit(0)
+
+def on_signal(*_):
+    global STOP
+    STOP=True
+signal.signal(signal.SIGTERM,on_signal)
+signal.signal(signal.SIGINT,on_signal)
+
+def load_cfg():
+    return json.loads(CFG_PATH.read_text())
+
+def log(msg):
+    print(msg,flush=True)
+
+def gpu_temp(cfg):
+    helper=Path.home()/'.local/bin/devnet-gpu-hotspot'
+    p=subprocess.run([str(helper)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=4)
+    if p.returncode != 0:
+        raise RuntimeError(p.stderr.strip() or 'GPU hotspot reader failed')
+    return float(p.stdout.strip())
+
+def raw_band(cfg,t):
+    for i,b in enumerate(cfg['bands']):
+        if t <= float(b['max']): return i
+    return len(cfg['bands'])-1
+
+def hysteresis_band(cfg,t,current):
+    if current is None: return raw_band(cfg,t)
+    h=float(cfg.get('hysteresis_c',1.0)); bands=cfg['bands']; idx=current
+    while idx < len(bands)-1 and t > float(bands[idx]['max']) + h: idx += 1
+    while idx > 0 and t <= float(bands[idx-1]['max']) - h: idx -= 1
+    return idx
+
+def find_named(client,wanted):
+    w=wanted.lower()
+    exact=[d for d in client.devices if d.name.lower()==w]
+    if exact: return exact[0]
+    partial=[d for d in client.devices if w in d.name.lower() or d.name.lower() in w]
+    return partial[0] if partial else None
+
+def find_commander(client):
+    for d in client.devices:
+        n=d.name.lower()
+        if 'commander' in n and 'core' in n:
+            return d
+    return None
+
+def safe_disconnect(client):
+    if client is None: return
+    try: client.disconnect()
+    except Exception: pass
+
+def prepare_device(dev,label):
+    if dev is None: return
+    try:
+        dev.set_custom_mode()
+        time.sleep(0.30)
+        log(f'{label}: persistent SDK control ready ({dev.name})')
+    except Exception as e:
+        log(f'{label}: mode setup warning: {e}')
+
+def connect_local(cfg):
+    c=OpenRGBClient(cfg['local_sdk_host'],int(cfg['local_sdk_port']),f'Devnet RGB v{APP_VERSION} local',protocol_version=1)
+    m=find_named(c,cfg['motherboard'])
+    g=find_named(c,cfg['gpu_rgb_device'])
+    ram_match=cfg.get('ram_rgb_device','Corsair Vengeance RGB DDR5').lower()
+    expected_ram=int(cfg.get('ram_count',2))
+    rams=[d for d in c.devices if ram_match in d.name.lower()]
+
+    if m: prepare_device(m,'Motherboard')
+    else: log('Motherboard: not present on OpenRGB SDK 6742')
+    if g: prepare_device(g,'GPU RGB')
+    else: log('GPU RGB: not present on OpenRGB SDK 6742')
+    for i,ram in enumerate(rams,1): prepare_device(ram,f'RAM {i}')
+    if len(rams) < expected_ram:
+        log(f'RAM: expected {expected_ram} {cfg.get("ram_rgb_device","Corsair Vengeance RGB DDR5")} modules on 6742; found {len(rams)}')
+    return c,m,g,rams
+
+def connect_hub(cfg):
+    c=OpenRGBClient(cfg['hub_sdk_host'],int(cfg['hub_sdk_port']),f'Devnet RGB v{APP_VERSION} Commander')
+    d=find_commander(c)
+    if d: prepare_device(d,'Commander RGB')
+    else: log('Commander RGB: port 6743 is reachable but the Commander is not exposed; toggle OpenRGB Integration in OpenLinkHub')
+    return c,d
+
+def apply(dev,rgb,label):
+    if dev is None: return False
+    try:
+        dev.set_color(RGBColor(*rgb),fast=True)
+        return True
+    except Exception as e:
+        log(f'{label}: SDK write failed: {e}')
+        return False
+
+def apply_commander(dev,rgb,label='Commander RGB'):
+    if dev is None: return False
+    try:
+        dev.set_color(RGBColor(*rgb),fast=True)
+        return True
+    except Exception as e:
+        log(f'{label}: whole-device SDK write failed: {e}')
+        return False
+
+def turn_off_devices(local_client,mobo,gpu,rams,hub_client,commander):
+    black=[0,0,0]
+    local_targets=[(mobo,'Motherboard'),(gpu,'GPU RGB')]
+    local_targets += [(ram,f'RAM {i}') for i,ram in enumerate(rams,1)]
+    for dev,label in local_targets:
+        if dev is None: continue
+        try:
+            dev.set_color(RGBColor(*black),fast=True)
+            log(f'{label}: off')
+            time.sleep(.10)
+        except Exception as e:
+            log(f'{label}: off warning: {e}')
+    if commander is not None:
+        try:
+            commander.set_color(RGBColor(*black),fast=True)
+            log('Commander RGB: off')
+        except Exception as e:
+            log(f'Commander RGB: off warning: {e}')
+
+def load_manual_override():
+    try:
+        data=json.loads(MANUAL_OVERRIDE_PATH.read_text())
+        if not data.get('enabled'): return None
+        rgb=data.get('rgb')
+        if not isinstance(rgb,list) or len(rgb)!=3: return None
+        return [max(0,min(255,int(v))) for v in rgb]
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        log(f'Manual RGB override warning: {e}')
+        return None
+
+def main():
+    cfg=load_cfg()
+    local_client=mobo=gpu=None
+    rams=[]
+    hub_client=commander=None
+    local_retry=time.monotonic()+float(cfg.get('local_start_delay_seconds',5))
+    hub_retry=0.0
+    last={'mobo':None,'gpu':None,'ram0':None,'ram1':None,'commander':None}
+    current=None
+    temp_fail=0
+    retry=float(cfg.get('retry_seconds',30))
+    startup_retry=float(cfg.get('startup_retry_seconds',3))
+    poll=float(cfg.get('poll_seconds',3))
+    expected_ram=int(cfg.get('ram_count',2))
+
+    log(f'Devnet RGB master v{APP_VERSION} started (persistent SDK; RAM + 5 Commander fan zones)')
+    try:
+        while not STOP:
+            now=time.monotonic()
+            if local_client is None and now >= local_retry:
+                try:
+                    local_client,mobo,gpu,rams=connect_local(cfg)
+                    if mobo is None or gpu is None or len(rams) < expected_ram:
+                        missing=[]
+                        if mobo is None: missing.append('motherboard')
+                        if gpu is None: missing.append('GPU')
+                        if len(rams) < expected_ram: missing.append(f'RAM({len(rams)}/{expected_ram})')
+                        log('OpenRGB 6742 detection still settling; missing '+', '.join(missing)+'. Reconnecting SDK only.')
+                        safe_disconnect(local_client)
+                        local_client=mobo=gpu=None; rams=[]; local_retry=now+startup_retry
+                    else:
+                        local_retry=0
+                except Exception as e:
+                    log(f'Local OpenRGB SDK connect warning: {e}')
+                    safe_disconnect(local_client)
+                    local_client=mobo=gpu=None; rams=[]; local_retry=now+retry
+
+            if hub_client is None and now >= hub_retry:
+                try:
+                    hub_client,commander=connect_hub(cfg)
+                    if commander is None:
+                        safe_disconnect(hub_client); hub_client=None; hub_retry=now+retry
+                    else: hub_retry=0
+                except Exception as e:
+                    log(f'Commander SDK connect warning: {e}')
+                    safe_disconnect(hub_client); hub_client=commander=None; hub_retry=now+retry
+
+            try:
+                t=gpu_temp(cfg)
+                manual_rgb=load_manual_override()
+                if manual_rgb is not None:
+                    rgb=manual_rgb
+                    idx=f"manual:{rgb[0]:02X}{rgb[1]:02X}{rgb[2]:02X}"
+                    b={'name':'manual','rgb':rgb}
+                else:
+                    idx=hysteresis_band(cfg,t,current)
+                    b=cfg['bands'][idx]; current=idx; rgb=b['rgb']
+                temp_fail=0
+
+                commander_changed=False
+                if commander is not None and last['commander'] != idx:
+                    if apply_commander(commander,rgb):
+                        last['commander']=idx; commander_changed=True
+                        log(f"GPU Hotspot {t:.1f}C -> {b['name']} #{rgb[0]:02X}{rgb[1]:02X}{rgb[2]:02X} | Commander RGB whole-device=OK")
+                        time.sleep(float(cfg.get('commander_sync_lead_seconds',0.08)))
+                    else:
+                        safe_disconnect(hub_client); hub_client=commander=None; last['commander']=None; hub_retry=time.monotonic()+retry
+
+                local_targets=[('mobo',mobo,'Motherboard'),('gpu',gpu,'GPU RGB')]
+                local_targets += [(f'ram{i}',ram,f'RAM {i+1}') for i,ram in enumerate(rams[:expected_ram])]
+                local_failed=False
+                for key,dev,label in local_targets:
+                    if dev is not None and last.get(key) != idx:
+                        if apply(dev,rgb,label):
+                            last[key]=idx
+                            log(f"GPU Hotspot {t:.1f}C -> {b['name']} #{rgb[0]:02X}{rgb[1]:02X}{rgb[2]:02X} | {label}=OK")
+                        else:
+                            safe_disconnect(local_client); local_client=mobo=gpu=None; rams=[]
+                            for k in ('mobo','gpu','ram0','ram1'): last[k]=None
+                            local_retry=time.monotonic()+retry; local_failed=True; break
+
+                if commander_changed and not local_failed and commander is not None:
+                    time.sleep(.02)
+                    if not apply_commander(commander,rgb,'Commander RGB sync refresh'):
+                        log('Commander RGB sync refresh warning: first whole-device write already succeeded')
+            except Exception as e:
+                temp_fail += 1
+                if temp_fail in (1,10,100): log(f'GPU hotspot temperature read warning: {e}')
+
+            end=time.monotonic()+poll
+            while not STOP and time.monotonic()<end: time.sleep(.10)
+    finally:
+        log(f'Devnet RGB master v{APP_VERSION} stopping: switching controlled RGB off')
+        turn_off_devices(local_client,mobo,gpu,rams,hub_client,commander)
+        safe_disconnect(hub_client); safe_disconnect(local_client)
+        log(f'Devnet RGB master v{APP_VERSION} stopped')
+
+if __name__=='__main__':
+    main()
