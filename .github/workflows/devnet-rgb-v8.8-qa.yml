@@ -1,10 +1,11 @@
 name: Devnet RGB v8.8 package QA
 
 on:
+  push:
+    branches:
+      - main
+      - release-v8.8
   pull_request:
-    paths:
-      - 'standalone-v8.8-test/**'
-      - '.github/workflows/devnet-rgb-v8.8-qa.yml'
   workflow_dispatch:
 
 jobs:
@@ -20,4 +21,18 @@ jobs:
           python3 --version
 
       - name: Run standalone package QA
-        run: bash standalone-v8.8-test/tests/test-package.sh
+        run: bash tests/test-package.sh
+
+      - name: Build release archive
+        run: |
+          git archive --format=zip --prefix=devnet-rgb-control-v8.8/ HEAD -o devnet-rgb-control-v8.8.zip
+          sha256sum devnet-rgb-control-v8.8.zip > devnet-rgb-control-v8.8.zip.sha256
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: devnet-rgb-control-v8.8
+          path: |
+            devnet-rgb-control-v8.8.zip
+            devnet-rgb-control-v8.8.zip.sha256
+          if-no-files-found: error

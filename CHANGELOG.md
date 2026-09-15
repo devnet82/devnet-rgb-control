@@ -1,8 +1,8 @@
 # Changelog
 
-## v8.8 — standalone test build
+## v8.8 — physically verified standalone release
 
-Based on the physically verified v8.7 runtime.
+Based on the physically verified v8.7 runtime and then fully retested as the standalone v8.8 package.
 
 Changes:
 
@@ -24,8 +24,22 @@ Changes:
 
 No OpenLinkHub fan curve is supplied or rewritten by the normal installer.
 
+Physical acceptance completed successfully on the reference CachyOS system:
+
+- standalone install/upgrade from v8.7
+- RGB Doctor v8.8
+- protected OpenLinkHub file hash verification
+- dashboard/version checks
+- reboot/autostart
+- normal shutdown
+- cold power-on
+- motherboard, GPU, both RAM modules and Commander RGB operation
+- fan behaviour remained under OpenLinkHub
+
+Rollback restoration and uninstall were additionally tested in the automated fake-HOME package QA. Live rollback was not deliberately performed after the good hardware acceptance test.
+
 ## v8.7 — physically verified baseline
 
 v8.7 was captured from the working installation after passing installation, RGB Doctor, reboot, dashboard/version checks, normal shutdown, cold power-on and physical RGB/fan verification on the reference hardware.
 
-Its runtime behaviour is the baseline for v8.8.
+Its runtime behaviour was the baseline for v8.8.
