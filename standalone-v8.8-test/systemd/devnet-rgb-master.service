@@ -1,0 +1,15 @@
+[Unit]
+Description=Devnet RGB v8.8 persistent GPU-hotspot controller
+Wants=OpenLinkHub.service
+Requires=devnet-openrgb-server.service
+After=OpenLinkHub.service devnet-openrgb-server.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/devnet-rgb/venv/bin/python %h/.local/bin/devnet-rgb-master
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
