@@ -118,7 +118,6 @@ fi
 import re,sys
 from pathlib import Path
 root=Path(sys.argv[1])
-text_suffixes={'.py','.service','.desktop',''}
 for p in root.rglob('*'):
     if not p.is_file(): continue
     try: s=p.read_text()
@@ -129,7 +128,6 @@ for p in root.rglob('*'):
     if s!=old: p.write_text(s)
 PY
 
-# Ensure executable scripts remain executable after staging edits.
 find "$STAGE/.local/bin" -maxdepth 1 -type f -name 'devnet-*' -exec chmod +x {} + 2>/dev/null || true
 
 say "Static checks before touching the working installation"
@@ -144,7 +142,6 @@ for p in "$STAGE/.local/bin/devnet-rgb-control" "$STAGE/.local/bin/devnet-rgb-do
   echo "[PASS] shell syntax: $(basename "$p")"
 done
 
-# Version consistency on user-facing/runtime files.
 VERSION_FILES=(
  "$STAGE/.local/bin/devnet-rgb-master"
  "$STAGE/.local/bin/devnet-rgb-control-app"
@@ -163,6 +160,7 @@ rollback_internal(){
   echo "!!! v8.7 installation failed — restoring the saved v8.6 application !!!"
   systemctl --user stop devnet-rgb-control-app.service devnet-rgb-master.service devnet-openrgb-server.service >/dev/null 2>&1 || true
   while IFS= read -r rel; do rm -rf "$HOME_DIR/$rel"; done < "$MANIFEST"
+  rm -f "$BIN/devnet-rgb-doctor-v87.py"
   tar -xzf "$BACKUP/devnet-rgb-v8.6-working-files.tar.gz" -C "$HOME_DIR"
   systemctl --user daemon-reload
   systemctl --user enable devnet-openrgb-server.service devnet-rgb-master.service devnet-rgb-control-app.service >/dev/null 2>&1 || true
@@ -178,7 +176,6 @@ say "Controlled uninstall of the old Devnet RGB application files"
 systemctl --user stop devnet-rgb-control-app.service devnet-rgb-master.service devnet-openrgb-server.service
 while IFS= read -r rel; do rm -rf "$HOME_DIR/$rel"; done < "$MANIFEST"
 systemctl --user daemon-reload
-# OpenRGB and OpenLinkHub packages/data are deliberately not removed.
 echo "[PASS] old Devnet RGB application files removed"
 echo "[PASS] OpenRGB package left installed"
 echo "[PASS] OpenLinkHub installation/profile data left installed"
@@ -186,7 +183,6 @@ echo "[PASS] OpenLinkHub installation/profile data left installed"
 say "Installing staged Devnet RGB Control v8.7"
 while IFS= read -r rel; do
   src="$STAGE/$rel"
-  # Doctor source was renamed from v86 to v87.
   if [[ "$rel" == ".local/bin/devnet-rgb-doctor-v86.py" ]]; then src="$STAGE/.local/bin/devnet-rgb-doctor-v87.py"; rel=".local/bin/devnet-rgb-doctor-v87.py"; fi
   [[ -e "$src" ]] || continue
   mkdir -p "$HOME_DIR/$(dirname "$rel")"
@@ -211,7 +207,6 @@ if [[ -x "$BIN/devnet-rgb-doctor" ]]; then "$BIN/devnet-rgb-doctor"; fi
 
 say "Confirming fan/profile files were not changed"
 sha256sum -c "$PROTECTED"
-
 echo "[PASS] protected OpenLinkHub files unchanged"
 
 say "Capturing the installed v8.7 test state"
