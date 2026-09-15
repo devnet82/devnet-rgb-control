@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Devnet RGB Control
+Comment=Devnet RGB Control v8.8 status, diagnostics and safe controls
+Exec=__HOME__/.local/bin/devnet-rgb-control
+Icon=preferences-desktop-color
+Terminal=false
+Categories=Settings;System;
+StartupNotify=true
