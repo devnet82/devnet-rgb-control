@@ -1,0 +1,17 @@
+[Unit]
+Description=Devnet RGB v8.8 persistent OpenRGB hardware/SDK server
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStartPre=%h/.local/share/devnet-rgb/venv/bin/python %h/.local/bin/devnet-openrgb-wait-i2c.py --timeout 120
+ExecStart=/usr/bin/openrgb --server --server-host 127.0.0.1 --server-port 6742 --config %h/.config/devnet-openrgb-server --noautoconnect --verbose
+ExecStartPost=%h/.local/share/devnet-rgb/venv/bin/python %h/.local/bin/devnet-openrgb-validate-6742.py --timeout 150
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=290
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target
