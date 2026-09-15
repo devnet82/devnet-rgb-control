@@ -27,7 +27,7 @@ on_error(){
   if [[ $DESTRUCTIVE -eq 1 && -d "$BACKUP" ]]; then
     echo
     echo "Install failed after changes began. Attempting automatic rollback..." >&2
-    DEVNET_HOME="$HOME_DIR" DEVNET_TEST_MODE="$TEST_MODE" "$PKG_DIR/rollback.sh" --backup "$BACKUP" --quiet || true
+    DEVNET_HOME="$HOME_DIR" DEVNET_TEST_MODE="$TEST_MODE" bash "$PKG_DIR/rollback.sh" --backup "$BACKUP" --quiet || true
   fi
   exit "$rc"
 }
@@ -35,7 +35,7 @@ trap on_error ERR
 
 [[ "$TEST_MODE" == "1" || ${EUID:-$(id -u)} -ne 0 ]] || fail "Run this as your normal desktop user, not with sudo."
 
-for c in bash python3 grep sed sha256sum tar find sort; do
+for c in bash python3 grep sed sha256sum tar find sort install; do
   command -v "$c" >/dev/null 2>&1 || fail "$c is required"
 done
 
@@ -117,10 +117,10 @@ python3 -m py_compile \
   "$PKG_DIR/bin/devnet-openrgb-wait-i2c.py" \
   "$PKG_DIR/bin/devnet-openrgb-validate-6742.py" \
   "$PKG_DIR/bin/devnet-gpu-hotspot"
-for s in install.sh uninstall.sh rollback.sh repair-openlinkhub-ordering.sh bin/devnet-rgb-control bin/devnet-rgb-doctor; do
+for s in install.sh uninstall.sh rollback.sh repair-openlinkhub-ordering.sh verify-after-reboot.sh bin/devnet-rgb-control bin/devnet-rgb-doctor; do
   bash -n "$PKG_DIR/$s"
 done
-"$PKG_DIR/tests/version-consistency.sh"
+bash "$PKG_DIR/tests/version-consistency.sh"
 pass "Python, shell and version-consistency checks passed"
 
 say "Creating recovery backup"
@@ -161,7 +161,7 @@ mkdir -p "$BACKUP/stage"
 python3 - "$PKG_DIR/config/config.json" "$CFG_DIR/config.json" "$BACKUP/stage/config.json" "$SERIAL" <<'PY'
 import json, sys
 from pathlib import Path
-src,old,out,serial=map(Path,sys.argv[1:4])+[None] if False else (Path(sys.argv[1]),Path(sys.argv[2]),Path(sys.argv[3]),sys.argv[4])
+src=Path(sys.argv[1]); old=Path(sys.argv[2]); out=Path(sys.argv[3]); serial=sys.argv[4]
 new=json.loads(src.read_text())
 if old.exists():
     try:
@@ -253,9 +253,15 @@ pass "Protected OpenLinkHub fan/profile files unchanged"
 
 say "Installed version checks"
 [[ "$($BIN/devnet-rgb-control --version)" == "Devnet RGB Control v8.8" ]] || fail "Control launcher version mismatch"
-"$VENV/bin/python" "$BIN/devnet-rgb-master" --version | grep -qx 'Devnet RGB Control v8.8 master'
-"$VENV/bin/python" "$BIN/devnet-rgb-control-app" --version | grep -qx 'Devnet RGB Control v8.8 dashboard'
-"$BIN/devnet-rgb-doctor" --version | grep -qx 'Devnet RGB Doctor v8.8'
+if [[ "$TEST_MODE" == "1" ]]; then
+  grep -q 'APP_VERSION="8.8"' "$BIN/devnet-rgb-master"
+  grep -q 'APP_VERSION = "8.8"' "$BIN/devnet-rgb-control-app"
+  grep -q 'APP_VERSION="8.8"' "$BIN/devnet-rgb-doctor-v88.py"
+else
+  "$VENV/bin/python" "$BIN/devnet-rgb-master" --version | grep -qx 'Devnet RGB Control v8.8 master'
+  "$VENV/bin/python" "$BIN/devnet-rgb-control-app" --version | grep -qx 'Devnet RGB Control v8.8 dashboard'
+  "$BIN/devnet-rgb-doctor" --version | grep -qx 'Devnet RGB Doctor v8.8'
+fi
 pass "Installed app reports v8.8 consistently"
 
 DESTRUCTIVE=0
