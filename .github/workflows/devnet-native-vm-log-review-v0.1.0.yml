@@ -1,0 +1,39 @@
+name: RGB native CachyOS VM test log inspection v0.1.0
+on:
+  push:
+    branches:
+      - qa/cachyos-package-vm-log-v0.1.0
+permissions:
+  contents: read
+  actions: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Read existing VM evidence only (no application changes)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p logs
+          gh run download 38135367952 --repo "$GITHUB_REPOSITORY" --name exact-native-cachyos-package-vm-v0.1.2 --dir logs
+          python3 - <<'PY'
+          import json,pathlib
+          p=pathlib.Path("logs/qa-result.json")
+          d=json.loads(p.read_text())
+          print("VM_REPORT",json.dumps(d,indent=2)[:9000])
+          l=pathlib.Path("logs/package-tests.log")
+          if l.exists():
+              s=l.read_text(errors="replace")
+              print("PACKAGE_TEST_LOG_BEGIN")
+              print(s[-10000:])
+              print("PACKAGE_TEST_LOG_END")
+          c=pathlib.Path("logs/controller.log")
+          if c.exists():
+              print("CONTROLLER_LOG",c.read_text(errors="replace")[-4000:])
+          PY
